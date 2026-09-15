@@ -18,17 +18,36 @@ Set these in your shell / .env (do not commit .env):
   REDIS_HOST        = <redis host>   (optional, defaults to localhost)
 """
 
+import os
+
 from dagster import ConfigurableResource, InitResourceContext
-import psycopg2
+
+# WDAC (Application Control) di laptop kantor memblokir DLL native pip-installed
+# (psycopg2 binary, psycopg-binary) karena tidak "Enterprise signed". libpq.dll dari
+# installer resmi PostgreSQL LOLOS kebijakan itu, jadi psycopg (v3) dipaksa pakai
+# mode "python" (ctypes) yang me-load libpq.dll tsb, bukan psycopg-binary/c.
+# psycopg cari libpq lewat ctypes.util.find_library, yang menyusuri PATH proses --
+# bukan lewat os.add_dll_directory -- jadi folder bin Postgres di-prepend ke PATH
+# di sini (bukan diedit permanen di sistem) supaya berjalan sendiri (self-contained).
+for _pg_bin in (
+    r"C:\Program Files\PostgreSQL\18\bin",
+    r"C:\Program Files\PostgreSQL\17\bin",
+    r"C:\Program Files\PostgreSQL\16\bin",
+):
+    if os.path.isdir(_pg_bin):
+        os.environ["PATH"] = _pg_bin + os.pathsep + os.environ.get("PATH", "")
+        break
+
+import psycopg
 
 
 class PostgresResource(ConfigurableResource):
-    """Wraps a psycopg2 connection to the primary autometric_v2 database."""
+    """Wraps a psycopg (v3) connection to the primary autometric_v2 database."""
 
     connection_string: str  # injected from env in repository.py
 
     def get_conn(self):
-        return psycopg2.connect(self.connection_string)
+        return psycopg.connect(self.connection_string)
 
     def call_procedure(self, proc_call: str) -> None:
         """

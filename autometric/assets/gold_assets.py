@@ -19,6 +19,11 @@ Dependency (dari analisis FROM/JOIN tiap procedure):
   dim_content_pillar           <- pillar_performance_daily  (dimensi/konfig pillar, umbrella brand)
   comment_relevance_distribution <- comment_relevance_scores (distribusi tier komentar, umbrella brand)
   post_comment_timeline        <- unified_comment, unified_post  (timeline komentar per post, WIB harian)
+  audience_sentiment_monthly   <- comment_sentiment_scores, post_caption_sentiment_scores,
+                                   tagged_post_caption_sentiment_scores (3 source_type, bulanan)
+  comment_wordcloud_sentiment  <- unified_comment, comment_sentiment_scores (word cloud per sentiment/bulan)
+  ytd_performance               <- mart_brand_metric_daily (public.ytd_setting, bukan Silver/Feature)
+  kpi_achievement               <- mart_brand_metric_daily (public.kpi_setting, bukan Silver/Feature)
 
 Dua mart (comment_activity, community_contributors) baca feature.comment_relevance_scores,
 jadi depend pada asset comment_relevance_scores (Feature).
@@ -28,10 +33,13 @@ tidak dijadwalkan). Tidak disertakan di sini.
 """
 
 from dagster import asset, Output, AssetKey
-from psycopg2.extras import execute_values
+from autometric.pg_compat import execute_values
 
 from autometric.resources import PostgresResource
-from autometric.feature.comment_relevance_scorer import compute_wordcloud_per_post
+from autometric.feature.comment_relevance_scorer import (
+    compute_wordcloud_per_post,
+    compute_wordcloud_per_sentiment_month,
+)
 
 
 # Asset keys Silver & Feature (untuk deps lintas-file tanpa import langsung)
@@ -43,6 +51,8 @@ _STORY = AssetKey("unified_story")
 _TAGGED = AssetKey("unified_tagged_post")
 _FEATURE = AssetKey("comment_relevance_scores")
 _SENTIMENT_FEATURE = AssetKey("comment_sentiment_scores")
+_POST_CAPTION_SENTIMENT_FEATURE = AssetKey("post_caption_sentiment_scores")
+_TAGGED_CAPTION_SENTIMENT_FEATURE = AssetKey("tagged_post_caption_sentiment_scores")
 
 
 def _build(postgres: PostgresResource, proc: str, table: str) -> Output:
@@ -374,6 +384,188 @@ def comment_sentiment_post(postgres: PostgresResource) -> Output:
     return _build(postgres, "sp_build_comment_sentiment_post", "comment_sentiment_post")
 
 
+# --- Audience sentiment monthly (report: sentiment section) ---------------
+# Gabung 3 sumber (comment, post_caption, tagged_post_caption) jadi satu mart
+# additive per brand umbrella x platform x source_type x bulan. Persentase &
+# comparison current-vs-previous-month DIHITUNG DI VIEW (l2_gold.v_audience_
+# sentiment_mom, LAG per partition), bukan di sini -- pola sama dengan
+# v_campaign_posts (VIEW on-demand, tidak dijadwalkan Dagster).
+@asset(
+    group_name="gold",
+    deps=[_SENTIMENT_FEATURE, _POST_CAPTION_SENTIMENT_FEATURE, _TAGGED_CAPTION_SENTIMENT_FEATURE],
+    kinds={"postgres"},
+    description=(
+        "l2_gold.audience_sentiment_monthly (brand umbrella x platform x source_type x bulan) via "
+        "sp_build_audience_sentiment_monthly(). source_type = comment | post_caption | "
+        "tagged_post_caption. Additive count -- persentase & MoM comparison ada di VIEW "
+        "l2_gold.v_audience_sentiment_mom (LAG per partition), bukan di tabel ini."
+    ),
+)
+def audience_sentiment_monthly(postgres: PostgresResource) -> Output:
+    return _build(postgres, "sp_build_audience_sentiment_monthly", "audience_sentiment_monthly")
+
+
+# --- Word cloud per sentiment per bulan (report: sentiment section) -------
+# Sama pola dengan post_wordcloud (Python asset, bukan CALL procedure) --
+# tokenisasi butuh stopword/emoji handling yang cuma ada di Python
+# (reuse _tokenize via compute_wordcloud_per_sentiment_month). Grain beda:
+# brand umbrella x platform x sentiment_label x bulan (bukan per post),
+# supaya bisa difilter "kata apa yang paling sering muncul di komentar
+# positif/negatif bulan ini vs bulan lalu" di report.
+def _fetch_comments_with_sentiment_and_month(postgres: PostgresResource) -> list[dict]:
+    """Ambil comment_text + brand umbrella + sentiment_label + period_month.
+    brand_id di unified_comment sebenarnya social_account_id -> di-translate
+    ke brand umbrella via brand_social_accounts (pola sama sp_build_comment_
+    sentiment_daily)."""
+    conn = postgres.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    bsa.brand_id,
+                    c.platform,
+                    s.sentiment_label,
+                    date_trunc('month', c.comment_date)::date AS period_month,
+                    c.comment_text
+                FROM l1_silver.unified_comment c
+                JOIN feature.comment_sentiment_scores s
+                    ON s.comment_id = c.comment_id AND s.platform = c.platform
+                JOIN public.brand_social_accounts bsa
+                    ON bsa.social_account_id = c.brand_id
+                WHERE c.comment_text IS NOT NULL AND c.comment_text <> ''
+            """)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+@asset(
+    group_name="gold",
+    deps=[_COMMENT, _SENTIMENT_FEATURE],
+    kinds={"postgres", "python"},
+    description=(
+        "l2_gold.comment_wordcloud_sentiment — top-50 kata per (brand umbrella, platform, "
+        "sentiment_label, bulan) dari komentar. Untuk word cloud di section Audience Sentiment. "
+        "Baca Silver+Feature, tokenize di Python (reuse _tokenize), full REPLACE."
+    ),
+)
+def comment_wordcloud_sentiment(postgres: PostgresResource) -> Output:
+    comments = _fetch_comments_with_sentiment_and_month(postgres)
+    rows = compute_wordcloud_per_sentiment_month(comments, top_n=50)
+
+    conn = postgres.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE l2_gold.comment_wordcloud_sentiment")
+            if rows:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO l2_gold.comment_wordcloud_sentiment
+                        (brand_id, platform, sentiment_label, period_month, word, frequency)
+                    VALUES %s
+                    """,
+                    [
+                        (r["brand_id"], r["platform"], r["sentiment_label"], r["period_month"], r["word"], r["frequency"])
+                        for r in rows
+                    ],
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+    groups = {(r["brand_id"], r["platform"], r["sentiment_label"], r["period_month"]) for r in rows}
+    return Output(
+        len(rows),
+        metadata={
+            "rows": len(rows),
+            "groups_dengan_wordcloud": len(groups),
+            "comments_scanned": len(comments),
+            "table": "l2_gold.comment_wordcloud_sentiment",
+        },
+    )
+
+
+# --- YTD performance (public.ytd_setting + public.kpi_setting feature) ----
+# Beda pola dari mart lain: sp_calculate_ytd_performance() butuh parameter
+# (ytd_id, platform_id, metrics_target) per kombinasi -- bukan sp_build_*()
+# tanpa argumen yang rebuild satu mart utuh. Kombinasi metric yang di-track
+# per YTD ditentukan user dari app (app CALL procedure langsung saat user
+# pertama kali pilih metric -> row pertama masuk ke ytd_performance). Asset
+# ini cuma REFRESH kombinasi yang SUDAH ada (ytd_setting.is_active saja --
+# YTD yang sudah dinonaktifkan dibiarkan beku, tidak di-recompute tiap hari).
+# Procedure sendiri full recompute (delete+reinsert) per kombinasi, jadi
+# aman dipanggil ulang tiap hari (idempotent, self-heals kalau brand_metric_daily
+# di-backfill/dikoreksi setelah run sebelumnya).
+@asset(
+    group_name="gold",
+    deps=[mart_brand_metric_daily],
+    kinds={"postgres"},
+    description=(
+        "l2_gold.ytd_performance (grain: ytd_id x platform_id x metrics_target x metric_date) via "
+        "sp_calculate_ytd_performance(ytd_id, platform_id, metrics_target). Refresh harian untuk "
+        "tiap kombinasi yang sudah dipilih user (row sudah ada di ytd_performance) DAN "
+        "public.ytd_setting-nya masih is_active. Kombinasi baru didaftarkan oleh app (bukan asset "
+        "ini) saat user pertama kali memilih metric untuk sebuah YTD."
+    ),
+)
+def ytd_performance(postgres: PostgresResource) -> Output:
+    conn = postgres.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT yp.ytd_id, yp.platform_id, yp.metrics_target
+                FROM l2_gold.ytd_performance yp
+                JOIN public.ytd_setting ys ON ys.ytd_id = yp.ytd_id
+                WHERE ys.is_active
+            """)
+            combos = cur.fetchall()
+    finally:
+        conn.close()
+
+    conn = postgres.get_conn()
+    try:
+        with conn.cursor() as cur:
+            for ytd_id, platform_id, metrics_target in combos:
+                cur.execute(
+                    "CALL l2_gold.sp_calculate_ytd_performance(%s, %s, %s)",
+                    (str(ytd_id), str(platform_id), metrics_target),
+                )
+                conn.commit()  # per-combo commit -- 1 kombinasi gagal tidak nge-rollback yang lain
+    finally:
+        conn.close()
+
+    n = postgres.count_rows("l2_gold.ytd_performance")
+    return Output(
+        n,
+        metadata={
+            "rows": n,
+            "combos_refreshed": len(combos),
+            "table": "l2_gold.ytd_performance",
+        },
+    )
+
+
+# --- KPI achievement (public.kpi_setting) ----------------------------------
+# Beda dari ytd_performance: sp_calculate_kpi_achievement(p_kpi_id DEFAULT NULL)
+# kalau dipanggil TANPA argumen otomatis loop SEMUA public.kpi_setting yang
+# is_active (bukan cuma kombinasi yang sudah ada baris-nya) -- jadi cukup pola
+# _build() biasa, tidak perlu query kombinasi dulu seperti ytd_performance.
+@asset(
+    group_name="gold",
+    deps=[mart_brand_metric_daily],
+    kinds={"postgres"},
+    description=(
+        "l2_gold.kpi_achievement via sp_calculate_kpi_achievement(). Refresh harian untuk "
+        "semua public.kpi_setting yang is_active. KPI baru didaftarkan oleh app (bukan asset "
+        "ini) saat user membuat target KPI."
+    ),
+)
+def kpi_achievement(postgres: PostgresResource) -> Output:
+    return _build(postgres, "sp_calculate_kpi_achievement", "kpi_achievement")
+
+
 gold_assets = [
     mart_brand_metric_daily,
     post_metric,
@@ -393,4 +585,8 @@ gold_assets = [
     post_wordcloud,
     comment_sentiment_daily,
     comment_sentiment_post,
+    audience_sentiment_monthly,
+    comment_wordcloud_sentiment,
+    ytd_performance,
+    kpi_achievement,
 ]

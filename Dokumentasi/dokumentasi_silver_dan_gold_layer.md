@@ -21,7 +21,7 @@ l0_raw → l0_harmonization → l1_silver → feature (NLP) → l2_gold → (Fas
 ```
 
 **Pembagian tanggung jawab:**
-- **Dagster** — dependency ordering, scheduling (`daily_pipeline_job`, 02:00 WIB), freshness (25 jam), eksekusi NLP Python, invalidasi cache. Tiap asset hanya memanggil stored procedure + melaporkan row count. Detail asset graph lengkap di [§1.1](#11-orkestrasi-dagster--asset-graph--urutan).
+- **Dagster** — dependency ordering, scheduling (`daily_pipeline_job`, 03:15 WIB, ⚠️ digeser dari 02:00 WIB — lihat §1.1), freshness (25 jam), eksekusi NLP Python, invalidasi cache, plus 2 sensor event-driven (`new_account_sensor`, `csv_upload_sensor`). Tiap asset hanya memanggil stored procedure + melaporkan row count (kecuali Feature & `post_wordcloud`/`comment_wordcloud_sentiment`, yang jalan Python). Detail asset graph lengkap di [§1.1](#11-orkestrasi-dagster--asset-graph--urutan).
 - **Stored procedure** — transformasi data sesungguhnya. `sp_sync_*` mengisi Silver dari harmonization; `sp_build_*` mengisi Gold dari Silver/Feature.
 - **Frontend (Model 1)** — query tabel Gold langsung via SQL.
 
@@ -46,33 +46,38 @@ l0_raw → l0_harmonization → l1_silver → feature (NLP) → l2_gold → (Fas
 
 ### 1.1 Orkestrasi Dagster — Asset Graph & Urutan
 
-Dikonfirmasi dari kode asset terbaru (`silver_assets.py`, `harmonization_assets.py`, `feature_assets.py`, `gold_assets.py`, `competitor_assets.py`, `jobs.py`, `repository.py`, `resources.py`, `sensors.py` — 10 Jul 2026). Ini jawab "gimana ngisinya pas run di Dagster", bukan cuma dari sisi SQL.
+Dikonfirmasi dari kode asset terbaru (`silver_assets.py`, `harmonization_assets.py`, `feature_assets.py`, `gold_assets.py`, `competitor_assets.py`, `jobs.py`, `repository.py`, `resources.py`, `sensors.py` — **direfresh 2026-09-10**, sebelumnya 10 Jul 2026). Ini jawab "gimana ngisinya pas run di Dagster", bukan cuma dari sisi SQL.
 
 **Job & schedule:**
 - `daily_pipeline_job` = `AssetSelection.all()` — materialize **seluruh** asset dalam satu run, urutan dijaga otomatis oleh dependency graph (bukan didaftar manual satu-satu).
-- `daily_schedule`: cron `0 2 * * *`, timezone `Asia/Jakarta` → **02:00 WIB tiap hari**, seluruh transform (harmonization → gold) dipicu di sini. Nggak ada `pg_cron` lagi sama sekali.
-- **Sensor: sengaja kosong** (`sensors=[]`). 2 sensor yang direncanakan di blueprint awal digugurkan: `csv_upload_sensor` (sistem API-only, nggak ada file upload yang perlu di-watch) dan `replica_lag_sensor` (replica Tiger Cloud murni buat HA/failover, pipeline nggak pernah baca dari replica, jadi lag nggak relevan).
+- `daily_schedule`: cron `15 3 * * *`, timezone `Asia/Jakarta` → **03:15 WIB tiap hari** (⚠️ digeser dari 02:00 WIB — buffer setelah scraper competitor Apify jalan 03:00 WIB, datanya landing ~03:01-03:03 WIB). Seluruh transform (harmonization → gold) dipicu di sini. Nggak ada `pg_cron` lagi sama sekali.
+- **Sensor: DUA aktif** (⚠️ bukan `sensors=[]` lagi) — `new_account_sensor` (akun baru siap diolah) dan `csv_upload_sensor` (⚠️ ditambahkan 2026-07-30, sempat digugurkan di blueprint awal karena sistem dianggap API-only, diaktifkan lagi karena kebutuhan riil upload CSV manual). `replica_lag_sensor` tetap gugur (replica Tiger Cloud murni buat HA/failover, pipeline nggak pernah baca dari replica). Detail lengkap ada di `dokumentasi_dagster_autometric.md` §6.
 - **Freshness check**: 25 jam, cuma di 5 asset Silver (`unified_post`, `unified_comment`, `unified_audience`, `unified_profile`, `unified_story`) — **`unified_tagged_post` sengaja dikecualikan** karena UGC sifatnya sporadis, guard 25 jam bakal sering false-alarm.
-- **Resources**: `SentenceTransformerResource` (model `paraphrase-multilingual-MiniLM-L12-v2`, buat `comment_relevance_scores`) dan `SentimentModelResource` (`w11wo/indonesian-roberta-base-sentiment-classifier`, buat `comment_sentiment_scores`) — keduanya di-load sekali per run lewat `setup_for_execution` (bukan saat Dagster daemon start), biar nggak nambah startup timeout.
+- **Resources**: `SentenceTransformerResource` (model `paraphrase-multilingual-MiniLM-L12-v2`, buat `comment_relevance_scores`) dan `SentimentModelResource` (`w11wo/indonesian-roberta-base-sentiment-classifier`, buat `comment_sentiment_scores` **dan** dua asset caption-sentiment baru 2026-09-08) — keduanya di-load sekali per run lewat `setup_for_execution` (bukan saat Dagster daemon start), biar nggak nambah startup timeout.
 
 **Urutan dependency per layer** (`A ← B` artinya asset A depend ke asset B, harus nunggu B selesai):
 
 | Layer | Asset | Depend ke | Catatan |
 |---|---|---|---|
 | Harmonization | `harmonized_post` | `l0_raw` (SourceAsset) | FB+IG+TikTok sekaligus (3 proc dalam 1 asset) |
-| Harmonization | `harmonized_comment` | `l0_raw` | FB+IG saja — **TikTok comment belum ada proc harmonization** |
+| Harmonization | `harmonized_comment` | `l0_raw` | FB+IG+TikTok (⚠️ proc TikTok — `sp_sync_tiktok_comment_from_raw` — dibuat 2026-08-19, sebelumnya TikTok comment belum ada proc harmonization) |
 | Harmonization | `harmonized_profile` | `l0_raw` | FB+IG+TikTok |
-| Harmonization | `harmonized_audience` | `l0_raw` | **IG saja** — proc FB audience deprecated (struktur raw FB berubah), sengaja nggak dipanggil |
+| Harmonization | `harmonized_audience` | `l0_raw` | IG+TikTok (⚠️ proc TikTok dibuat 2026-08-19). FB audience masih sengaja tidak dipanggil (struktur raw FB belum diverifikasi ulang) |
 | Harmonization | `harmonized_story` | `l0_raw` | IG saja |
 | Harmonization | `harmonized_tagged_post` | `l0_raw` | IG saja |
-| Silver | `unified_profile` | `harmonized_profile` | Independen, tapi **harus selesai duluan** — lihat baris di bawah |
-| Silver | `unified_post` | `harmonized_post` **DAN** `unified_profile` | ⚠️ **Baru — belum ada di versi dokumentasi sebelumnya.** `sp_sync_unified_post` baca `unified_profile` buat `followers_on_post_day` (carry-forward). Kalau `unified_profile` gagal/belum jalan, `unified_post` ikut ketahan di Dagster. |
+| Harmonization | `harmonized_tiktok_profile_native` ⚠️ baru 2026-08-19 | `harmonized_profile` | Isi kolom TikTok yang sebelumnya NULL terus, dari `l0_extra.tt_profile_native` |
+| Harmonization | `gapfilled_profile_dates` ⚠️ baru 2026-08-19 | `harmonized_profile` **DAN** `harmonized_tiktok_profile_native` | Gap-fill tanggal profile + re-run 3 proc `sp_sync_*_profile_from_raw` |
+| Harmonization | `normalized_audience_percentage` ⚠️ baru 2026-08-19 | `harmonized_audience` | Koreksi drift pembulatan persentase audience |
+| Silver | `unified_profile` | `gapfilled_profile_dates` (⚠️ bukan langsung `harmonized_profile` sejak 2026-08-19) | Independen, tapi **harus selesai duluan** — lihat baris di bawah |
+| Silver | `unified_post` | `harmonized_post` **DAN** `unified_profile` | `sp_sync_unified_post` baca `unified_profile` buat `followers_on_post_day` (carry-forward). Kalau `unified_profile` gagal/belum jalan, `unified_post` ikut ketahan di Dagster. |
 | Silver | `unified_comment` | `unified_post` **DAN** `harmonized_comment` | Comment sengaja jalan **setelah** post (bukan cuma harmonization) |
-| Silver | `unified_audience` | `harmonized_audience` | Independen |
+| Silver | `unified_audience` | `normalized_audience_percentage` (⚠️ bukan langsung `harmonized_audience` sejak 2026-08-19) | Independen |
 | Silver | `unified_story` | `harmonized_story` | Independen |
 | Silver | `unified_tagged_post` | `harmonized_tagged_post` | Independen |
 | Feature | `comment_relevance_scores` (+ `word_frequencies`) | `unified_comment` **DAN** `unified_post` | Butuh caption post induk |
 | Feature | `comment_sentiment_scores` | `unified_comment` saja | Nggak butuh caption/post |
+| Feature | `post_caption_sentiment_scores` ⚠️ baru 2026-09-08 | `unified_post` | Sentimen caption POST sendiri, REUSE `compute_sentiment_scores()` via field-rename |
+| Feature | `tagged_post_caption_sentiment_scores` ⚠️ baru 2026-09-08 | `unified_tagged_post` | Sentimen caption TAGGED POST (UGC, IG-only) |
 | Gold | `mart_brand_metric_daily` → `brand_metric_daily` | `unified_post`, `unified_comment`, `unified_profile` | |
 | Gold | `post_metric` | `unified_post` | |
 | Gold | `mart_comment_activity` → `comment_activity_daily`+`_hourly` | `unified_comment` | 1 SP isi 2 tabel. ⚠️ Dep ke `comment_relevance_scores` (Feature) DIHAPUS 2026-09-04 — SP-nya tidak pernah baca schema `feature`, dep lama cuma bikin nunggu NLP step tanpa alasan. Sekarang bisa jalan paralel dengan Feature layer. |
@@ -91,12 +96,23 @@ Dikonfirmasi dari kode asset terbaru (`silver_assets.py`, `harmonization_assets.
 | Gold | `post_wordcloud` (Python) | `unified_comment` | TRUNCATE+INSERT, di luar `sp_build_*` (tidak diubah) |
 | Gold | `comment_sentiment_daily` | `comment_sentiment_scores` (Feature) | |
 | Gold | `comment_sentiment_post` | `comment_sentiment_scores` (Feature) | |
+| Gold | `audience_sentiment_monthly` ⚠️ baru 2026-09-08 | `comment_sentiment_scores`, `post_caption_sentiment_scores`, `tagged_post_caption_sentiment_scores` | Gabung 3 source_type jadi 1 mart bulanan |
+| Gold | `comment_wordcloud_sentiment` (Python) ⚠️ baru 2026-09-08 | `unified_comment`, `comment_sentiment_scores` | Word cloud per sentiment/bulan, TRUNCATE+INSERT |
+| Gold | `ytd_performance` ⚠️ baru 2026-09-08 | `mart_brand_metric_daily` | Refresh harian kombinasi YTD yang sudah `is_active` |
 | Kompetitor (Silver) | `unified_competitor_post` | `harmonized_post` (asset **sama** dengan brand utama) | |
-| Kompetitor (Silver) | `unified_competitor_profile_daily` | `harmonized_profile` (asset **sama** dengan brand utama) | |
+| Kompetitor (Silver) | `unified_competitor_profile_daily` | `gapfilled_profile_dates` (⚠️ bukan langsung `harmonized_profile` sejak 2026-08-19) | |
 | Kompetitor (Gold) | `competitor_post_metric` | `unified_competitor_post` | |
 | Kompetitor (Gold) | `competitor_profile_metric_daily` | `unified_competitor_profile_daily` **DAN** `competitor_post_metric` | Proc gold-nya JOIN ke `unified_competitor_post` buat agregasi harian |
 
-⚠️ **Beberapa komentar di kode udah basi** (nggak sinkron sama asset yang beneran terdaftar) — dicatat biar nggak bingung kalau baca kodenya langsung: docstring `jobs.py` masih bilang "8 gold mart assets" & "1 feature asset", padahal sekarang ada 20 asset Gold (termasuk kompetitor) dan 2 asset Feature. Docstring `harmonization_assets.py` juga masih bilang `harmonized_tagged_post` "belum tersambung ke hilir", padahal `unified_tagged_post` (Silver) sudah depend ke situ. Asset graph (yang beneran dieksekusi Dagster) yang jadi acuan, bukan komentarnya.
+⚠️ **Diperbarui 2026-09-10:** total sekarang 9 asset Harmonization (dari 6), 4 asset
+Feature (dari 2), dan 21 asset Gold (dari 18, di luar kompetitor) — lihat
+`dokumentasi_dagster_autometric.md` §3 untuk breakdown & wave/topological order
+lengkap (berubah dari 7 wave jadi 9 wave karena rantai `gapfilled_profile_dates`
+menambah 2 langkah di critical path). Beberapa komentar di kode masih basi (nggak
+sinkron sama asset yang beneran terdaftar) — dicatat biar nggak bingung kalau baca
+kodenya langsung: docstring `jobs.py` masih bilang "8 gold mart assets" & "1
+feature asset". Asset graph (yang beneran dieksekusi Dagster) yang jadi acuan,
+bukan komentarnya.
 
 ---
 
@@ -479,6 +495,26 @@ Top-N kata per brand (top_n=50, stopword ID+EN dibuang). `brand_id` di sini per-
 | word | text | NO |
 | frequency | integer | NO |
 | scored_at | timestamp with time zone | NO |
+
+### `post_caption_sentiment_scores` / `tagged_post_caption_sentiment_scores` ⚠️ baru 2026-09-08
+
+**Asset Dagster:** `post_caption_sentiment_scores` (deps `unified_post`) dan
+`tagged_post_caption_sentiment_scores` (deps `unified_tagged_post`, IG-only UGC).
+**Duplicate handling: UPSERT** (`ON CONFLICT (post_id, platform) DO UPDATE`, dari
+Python — pola identik `comment_sentiment_scores`).
+
+Sentimen caption POST/TAGGED POST sendiri (bukan komentar), model & pipeline sama
+persis dengan `comment_sentiment_scores` — REUSE `compute_sentiment_scores()` apa
+adanya lewat field-rename (`comment_id`←`post_id`, `comment_text`←`caption`) di
+`feature_assets.py`, supaya jalur `comment_sentiment_scores` yang sudah production
+tidak disentuh. Comment di tagged post **tidak** ikut discore (raw-nya nggak
+pernah ada — overlap `unified_comment.post_id` vs `unified_tagged_post.post_id` = 0).
+
+Kolom yang confirmed dari `INSERT` di kode (⚠️ tipe & kolom lengkap belum
+diverifikasi ulang ke DB per baris ini, cuma dari SQL asset):
+`post_id`, `platform`, `brand_id`, `sentiment_label`, `sentiment_score`, plus
+kemungkinan `scored_at` (di-`SET ... scored_at = now()` saat UPDATE, sama pola
+`comment_sentiment_scores`).
 
 ---
 
@@ -1001,6 +1037,18 @@ Efeknya sama kayak `ON CONFLICT DO NOTHING` (seed nama baru doang, nggak nimpa e
 | engagement | bigint | YES |
 | engagement_rate | numeric | YES |
 | engagement_rate_base | text | YES |
+
+### 4.17 `audience_sentiment_monthly`, `comment_wordcloud_sentiment`, `ytd_performance` ⚠️ baru 2026-09-08
+
+Belum ter-query ulang ke DB (⚠️ kolom & tipe di bawah cuma dari deskripsi asset
+Dagster dan SQL `INSERT` di kode, per 2026-09-10 — beda dari tabel lain di
+dokumen ini yang confirmed via `information_schema`/`pg_constraint`):
+
+| Tabel | Builder | Grain | Duplicate handling | Fungsi |
+|---|---|---|---|---|
+| `audience_sentiment_monthly` | `sp_build_audience_sentiment_monthly()` | brand umbrella x platform x `source_type` (comment/post_caption/tagged_post_caption) x bulan | UPSERT (asumsi, konsisten pola SP lain — belum confirmed langsung) | Section "Audience Sentiment" di report. Persentase & MoM comparison dihitung di VIEW `l2_gold.v_audience_sentiment_mom` (LAG per partition), BUKAN di tabel ini — pola sama `v_campaign_posts`. |
+| `comment_wordcloud_sentiment` | Python (`compute_wordcloud_per_sentiment_month`) | brand umbrella x platform x sentiment_label x bulan | TRUNCATE + INSERT | Word cloud di section Audience Sentiment. Kolom confirmed dari `INSERT`: `brand_id`, `platform`, `sentiment_label`, `period_month`, `word`, `frequency`. |
+| `ytd_performance` | `sp_calculate_ytd_performance(ytd_id, platform_id, metrics_target)` | ytd_id x platform_id x metrics_target x metric_date | Full recompute (delete+reinsert) per kombinasi di dalam SP — idempotent, self-heals kalau `brand_metric_daily` di-backfill | Beda pola dari mart lain: butuh parameter per kombinasi (bukan `sp_build_*()` tanpa argumen). Asset Dagster cuma REFRESH kombinasi yang **sudah ada** & `ytd_setting.is_active` — kombinasi baru didaftarkan app saat user pertama kali pilih metric, bukan oleh asset ini. |
 
 ---
 

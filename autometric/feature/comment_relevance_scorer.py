@@ -20,8 +20,9 @@ import re
 from collections import Counter
 from typing import Iterable
 
-# Model multilingual; util cosine dari sentence-transformers.
-from sentence_transformers import util
+# Model multilingual; util cosine dari sentence-transformers (import lazy di
+# dalam fungsi supaya modul ini tidak memicu load torch saat Dagster
+# membaca definitions).
 
 
 # --- Stopword ID + EN -----------------------------------------------------
@@ -74,6 +75,8 @@ def compute_relevance_scores(
             comment_id, platform, brand_id, relevance_score (0-100 float).
         Comment yang caption-nya tidak ada / kosong / comment_text kosong di-SKIP.
     """
+    from sentence_transformers import util
+
     # Saring comment yang punya pasangan caption valid.
     valid = []
     for c in comments:
@@ -148,6 +151,50 @@ def compute_wordcloud_per_post(
             rows.append({
                 "post_id": post_id,
                 "platform": platform,
+                "word": word,
+                "frequency": freq,
+            })
+    return rows
+
+
+def compute_wordcloud_per_sentiment_month(
+    comments: Iterable[dict],
+    top_n: int = 50,
+) -> list[dict]:
+    """
+    Hitung top-N kata per (brand_id, platform, sentiment_label, period_month)
+    dari comment_text. Dipakai untuk word cloud di section Audience Sentiment
+    (l2_gold.comment_wordcloud_sentiment) -- beda dari compute_wordcloud_per_post
+    (grain post+platform) dan compute_word_frequencies (grain brand+platform,
+    tanpa split sentiment/bulan). Reuse _tokenize yang sama, logika bersih-bersih
+    tidak diduplikasi.
+
+    Args:
+        comments: iterable dict, tiap dict minimal punya:
+            brand_id (str), platform (str), sentiment_label (str),
+            period_month (date), comment_text (str).
+        top_n: berapa kata teratas disimpan per grup (default 50).
+
+    Returns:
+        list dict siap di-insert ke l2_gold.comment_wordcloud_sentiment:
+            brand_id, platform, sentiment_label, period_month, word, frequency.
+        Grup tanpa token valid (komentar kosong / semua stopword) di-skip.
+    """
+    counters: dict[tuple, Counter] = {}
+    for c in comments:
+        key = (c.get("brand_id"), c.get("platform"), c.get("sentiment_label"), c.get("period_month"))
+        if any(k is None for k in key):
+            continue
+        counters.setdefault(key, Counter()).update(_tokenize(c.get("comment_text") or ""))
+
+    rows = []
+    for (brand_id, platform, sentiment_label, period_month), counter in counters.items():
+        for word, freq in counter.most_common(top_n):
+            rows.append({
+                "brand_id": brand_id,
+                "platform": platform,
+                "sentiment_label": sentiment_label,
+                "period_month": period_month,
                 "word": word,
                 "frequency": freq,
             })

@@ -1,8 +1,10 @@
 # Dokumentasi Dagster — Autometric
 
 > Disusun berdasarkan source code aktual (`repository.py`, `jobs.py`, `sensors.py`,
-> `resources.py`, `assets/*.py`) per 22 Juli 2026. Kalau ada perbedaan dengan versi
-> terbaru, source code adalah kebenaran — dokumen ini cuma potret pada saat dibuat.
+> `resources.py`, `assets/*.py`) per 22 Juli 2026, **direfresh 2026-09-10** setelah
+> banyak asset baru masuk (lihat ⚠️ note bertanggal di tiap bagian). Kalau ada
+> perbedaan dengan versi terbaru, source code adalah kebenaran — dokumen ini cuma
+> potret pada saat dibuat.
 
 ---
 
@@ -54,7 +56,7 @@ Yang didapat dengan pindah ke Dagster:
 | **Resource** | Koneksi/dependency eksternal yang di-inject ke asset (bukan variabel global), supaya tiap asset gampang di-unit-test. Ada 4: `postgres`, `nlp_model`, `sentiment_model`, `redis`. |
 | **Job** | Kumpulan asset yang dijalankan bareng dalam satu run. Cuma ada satu: `daily_pipeline_job` — isinya `AssetSelection.all()`, jadi otomatis mencakup semua asset yang terdaftar. |
 | **Schedule** | Pemicu job berdasarkan waktu. Cuma satu: cron `15 3 * * *` (03:15 WIB) menjalankan `daily_pipeline_job`. |
-| **Sensor** | Pemicu job berdasarkan event/kondisi DB (bukan waktu). Ada satu: `new_account_sensor` — polling tiap 60 detik, trigger `daily_pipeline_job` begitu ada akun baru yang siap diolah. Lihat Bagian 6. |
+| **Sensor** | Pemicu job berdasarkan event/kondisi DB (bukan waktu). Ada dua: `new_account_sensor` (akun baru) dan `csv_upload_sensor` (upload CSV manual, ⚠️ ditambahkan 2026-07-30 — sempat digugurkan di blueprint awal, diaktifkan lagi karena kebutuhan riil upload manual). Keduanya polling tiap 60 detik, trigger `daily_pipeline_job` yang sama. Lihat Bagian 6. |
 | **Asset Check** | Validasi otomatis di luar isi data, misalnya "apakah asset ini di-update dalam 25 jam terakhir". Dipakai buat freshness check di Silver. |
 | **group_name** | Label pengelompokan asset di UI Dagster (`l0`, `harmonization`, `silver`, `feature`, `gold`) — murni buat kerapian visual, tidak mempengaruhi eksekusi. |
 
@@ -74,16 +76,19 @@ Urutan lineage penuh: **`l0_raw` → `harmonization` → `silver` → `feature` 
 l0_raw (SourceAsset, diisi API ingest di luar Dagster)
    │
    ▼
-harmonization (6 asset)  — raw mentah → bentuk seragam per entitas
+harmonization (9 asset)  — raw mentah → bentuk seragam per entitas
    │
    ▼
 silver (6 asset + 2 asset competitor)  — union lintas-platform, siap dipakai hilir
    │
-   ├──▶ feature (2 asset)  — NLP: relevance, word freq, sentiment
+   ├──▶ feature (4 asset)  — NLP: relevance, word freq, sentiment (comment + caption post + caption tagged post)
    │         │
    ▼         ▼
-gold (18 asset + 2 asset competitor)  — mart siap query langsung oleh dashboard
+gold (21 asset + 2 asset competitor)  — mart siap query langsung oleh dashboard
 ```
+
+⚠️ **Diubah 2026-08-19 & 2026-09-08:** jumlah asset di atas naik dari versi sebelumnya
+(harmonization 6→9, feature 2→4, gold 18→21) — lihat rincian per bagian di bawah.
 
 ### 3.1 Layer `l0` — Source (bukan asset yang dieksekusi)
 
@@ -106,11 +111,14 @@ tetap wajar tapi lineage tetap bermakna.
 | Asset | Manggil procedure | Platform |
 |---|---|---|
 | `harmonized_post` | `sp_sync_facebook_post_from_raw`, `sp_sync_instagram_post_from_raw`, `sp_sync_tiktok_post_from_raw` | FB, IG, TikTok |
-| `harmonized_comment` | `sp_sync_facebook_comment_from_raw`, `sp_sync_instagram_comment_from_raw` | FB, IG (TikTok comment belum ada proc dari raw) |
+| `harmonized_comment` | `sp_sync_facebook_comment_from_raw`, `sp_sync_instagram_comment_from_raw`, `sp_sync_tiktok_comment_from_raw` | FB, IG, TikTok (⚠️ proc TikTok dibuat 2026-08-19, `l0_raw.tt_comments` sekarang ada — sebelumnya TikTok comment belum ada proc dari raw) |
 | `harmonized_profile` | `sp_sync_facebook_profile_from_raw`, `sp_sync_instagram_profile_from_raw`, `sp_sync_tiktok_profile_from_raw` | FB, IG, TikTok |
-| `harmonized_audience` | `sp_sync_instagram_audience_from_raw` | IG saja (FB audience deprecated karena struktur raw berubah) |
+| `harmonized_audience` | `sp_sync_instagram_audience_from_raw`, `sp_sync_tiktok_audience_from_raw` | IG, TikTok (⚠️ proc TikTok dibuat 2026-08-19, tabel `tiktok_audience` sebelumnya tidak ada sama sekali). FB audience **masih sengaja tidak** dipanggil di sini — proc-nya sudah di-`REPLACE` di sisi DB 2026-08-19 (support format flat-object percentage) tapi belum diverifikasi terhadap struktur raw FB audience production; jangan aktifkan sebelum dicek ulang |
 | `harmonized_story` | `sp_sync_instagram_story_from_raw` | IG saja |
-| `harmonized_tagged_post` | `sp_sync_instagram_tagged_post_from_raw` | IG saja (UGC — belum tersambung ke Silver mana pun, disertakan untuk kelengkapan) |
+| `harmonized_tagged_post` | `sp_sync_instagram_tagged_post_from_raw` | IG saja (UGC — sejak Feature layer §3.4, `tagged_post_caption_sentiment_scores` sudah membaca `unified_tagged_post` yang notabene depend ke sini, jadi sudah tersambung ke hilir) |
+| `harmonized_tiktok_profile_native` ⚠️ baru 2026-08-19 | `sp_sync_tiktok_profile_native_from_extra` | TikTok saja. Isi kolom yang sebelumnya NULL terus (`video_views`, `profile_reach`, `profile_views`, `comments`, `shares`, `net_growth`, `new_followers`, `lost_followers`) di `l0_harmonization.tiktok_profile` dari `l0_extra.tt_profile_native`. Depend ke `harmonized_profile` (UPDATE ke row yang sudah dibuat, harus jalan setelahnya) |
+| `gapfilled_profile_dates` ⚠️ baru 2026-08-19 | `sp_gapfill_profile_dates` + re-run 3 proc `sp_sync_*_profile_from_raw` | FB, IG, TikTok. Isi baris kosong (gap tanggal) profile snapshot dari tanggal akun didaftarkan sampai hari ini (LOCF untuk state field, 0 untuk flow field). MineralQUA + kompetitornya sengaja di-exclude (data demo/sintetis). Depend ke `harmonized_profile` **dan** `harmonized_tiktok_profile_native` |
+| `normalized_audience_percentage` ⚠️ baru 2026-08-19 | `sp_normalize_audience_percentage_rounding` | IG, TikTok. Koreksi drift pembulatan audience berformat persentase (total 95–105 → tepat 100); format absolut (raw count) tidak disentuh. Depend ke `harmonized_audience` |
 
 ### 3.3 Layer `silver` — Union Lintas-Platform, Siap Dipakai Hilir
 
@@ -121,10 +129,10 @@ Feature dan Gold. Ini adalah **tabel biasa** yang diisi stored procedure
 
 | Asset | Depend pada | Catatan urutan |
 |---|---|---|
-| `unified_profile` | `harmonized_profile` | Independen, tapi harus sync **duluan** — dibutuhkan `unified_post` |
+| `unified_profile` | `gapfilled_profile_dates` (⚠️ bukan langsung `harmonized_profile` sejak 2026-08-19 — supaya baris gap-filled ikut kebaca) | Independen, tapi harus sync **duluan** — dibutuhkan `unified_post` |
 | `unified_post` | `harmonized_post`, `unified_profile` | Butuh `unified_profile` untuk kolom `followers_on_post_day` (carry-forward) |
 | `unified_comment` | `unified_post`, `harmonized_comment` | Jalan **setelah** `unified_post` |
-| `unified_audience` | `harmonized_audience` | Independen |
+| `unified_audience` | `normalized_audience_percentage` (⚠️ bukan langsung `harmonized_audience` sejak 2026-08-19 — supaya koreksi drift pembulatan sudah jalan duluan) | Independen |
 | `unified_story` | `harmonized_story` | Independen |
 | `unified_tagged_post` | `harmonized_tagged_post` | Independen, IG-only, UGC |
 
@@ -144,8 +152,10 @@ harian), jadi guard 25 jam akan sering false-alarm kalau dipasang.
 |---|---|---|---|
 | `comment_relevance_scores` | `unified_comment`, `unified_post` | Skor relevansi comment vs caption (0–100, cosine similarity) **+** `word_frequencies` (top-50 kata per brand/platform) | Relevansi: **INCREMENTAL** (`ON CONFLICT DO NOTHING`, ⚠️ diubah 2026-09-04 dari REPLACE penuh — encode ulang semua histori tiap run makin lambat seiring data bertambah). `word_frequencies`: tetap REPLACE penuh (murah, bukan model inference). Lalu invalidate cache Redis per brand yang datanya berubah |
 | `comment_sentiment_scores` | `unified_comment` | Label sentimen komentar (positive/neutral/negative) pakai model IndoRoBERTa | **INCREMENTAL (UPSERT)** — pola yang sama sekarang juga dipakai `comment_relevance_scores` di atas, karena alasan yang sama: inference/encoding jauh lebih berat daripada re-fetch data, jadi re-proses seluruh histori tiap run boros compute |
+| `post_caption_sentiment_scores` ⚠️ baru 2026-09-08 | `unified_post` | Sentimen caption POST sendiri (bukan komentar), model & pola sama dengan `comment_sentiment_scores` | **INCREMENTAL (UPSERT)**. REUSE `compute_sentiment_scores()` apa adanya lewat field-rename (`comment_id`←`post_id`, `comment_text`←`caption`) — jalur `comment_sentiment_scores` yang sudah production tidak disentuh sama sekali |
+| `tagged_post_caption_sentiment_scores` ⚠️ baru 2026-09-08 | `unified_tagged_post` | Sentimen caption TAGGED POST (UGC, IG-only). Comment di tagged post **tidak** discore — raw-nya tidak pernah ada (overlap `unified_comment.post_id` vs `unified_tagged_post.post_id` = 0) | **INCREMENTAL (UPSERT)**, pola field-rename sama dengan `post_caption_sentiment_scores` |
 
-Kedua asset skip comment yang teksnya kosong/NULL.
+Keduanya (comment & post_caption/tagged_post_caption) di atas skip baris yang teksnya kosong/NULL. Tak satu pun dari 4 asset Feature yang invalidate Redis, kecuali `comment_relevance_scores`.
 
 ### 3.5 Layer `gold` — Mart Siap Query Dashboard
 
@@ -153,7 +163,7 @@ Kedua asset skip comment yang teksnya kosong/NULL.
 frontend (Model 1 — tanpa API intermediary). Semuanya tabel biasa (bukan hypertable),
 diisi via UPSERT/REPLACE di dalam stored procedure masing-masing.
 
-18 asset gold (di luar 2 asset competitor, lihat Bagian 3.6):
+21 asset gold (di luar 2 asset competitor, lihat Bagian 3.6):
 
 | Asset | Depend pada | Fungsi / halaman dashboard |
 |---|---|---|
@@ -175,6 +185,9 @@ diisi via UPSERT/REPLACE di dalam stored procedure masing-masing.
 | `post_wordcloud` | comment | Word cloud per post — **satu-satunya Gold asset yang jalan Python** (tokenisasi), bukan cuma CALL SP |
 | `comment_sentiment_daily` | `comment_sentiment_scores` | Breakdown sentimen harian per brand/platform |
 | `comment_sentiment_post` | `comment_sentiment_scores` | Breakdown sentimen + dominant sentiment per post |
+| `audience_sentiment_monthly` ⚠️ baru 2026-09-08 | `comment_sentiment_scores`, `post_caption_sentiment_scores`, `tagged_post_caption_sentiment_scores` | Gabung 3 `source_type` (comment/post_caption/tagged_post_caption) jadi satu mart additive per brand umbrella x platform x source_type x bulan, untuk section "Audience Sentiment" di report. Persentase & perbandingan MoM dihitung di VIEW `l2_gold.v_audience_sentiment_mom`, bukan di tabel ini |
+| `comment_wordcloud_sentiment` ⚠️ baru 2026-09-08 | `unified_comment`, `comment_sentiment_scores` | Word cloud per (brand umbrella, platform, sentiment_label, bulan) — **Python asset** (tokenisasi), bukan cuma CALL SP, sama pola dengan `post_wordcloud` |
+| `ytd_performance` ⚠️ baru 2026-09-08 | `mart_brand_metric_daily` | Refresh harian tiap kombinasi (ytd_id, platform_id, metrics_target) yang **sudah dipilih user dari app** dan `ytd_setting.is_active`. Beda pola dari mart lain: procedure-nya (`sp_calculate_ytd_performance`) butuh parameter per kombinasi, bukan `sp_build_*()` tanpa argumen — asset ini query kombinasi aktif dulu lalu `CALL` satu-satu (commit per kombinasi) |
 
 > Catatan: `v_campaign_posts` adalah VIEW biasa (dibuat saat diminta), **bukan** asset
 > Dagster — tidak dijadwalkan.
@@ -189,7 +202,7 @@ sudah handle keduanya sekaligus), jadi tidak perlu asset harmonization terpisah.
 | Asset | Layer | Depend pada |
 |---|---|---|
 | `unified_competitor_post` | silver | `harmonized_post` |
-| `unified_competitor_profile_daily` | silver | `harmonized_profile` |
+| `unified_competitor_profile_daily` | silver | `gapfilled_profile_dates` (⚠️ bukan langsung `harmonized_profile` sejak 2026-08-19 — kompetitor paling sering kena gap tanggal dari scraping yang gagal, jadi paling diuntungkan gap-fill) |
 | `competitor_post_metric` | gold | `unified_competitor_post` |
 | `competitor_profile_metric_daily` | gold | `unified_competitor_profile_daily`, `competitor_post_metric` (butuh post_metric duluan untuk agregasi like/comment/share harian) |
 
@@ -203,44 +216,56 @@ Dagster dari graph `deps` — tabel di bawah adalah hasil topological sort dari
 dependency yang sama seperti Bagian 3.2–3.6, cuma disusun jadi satu urutan run
 penuh dari awal sampai akhir:
 
+⚠️ **Dihitung ulang 2026-09-10** setelah asset `gapfilled_profile_dates`,
+`harmonized_tiktok_profile_native`, `normalized_audience_percentage` (2026-08-19)
+dan 4 asset sentiment/mart baru (2026-09-08, lihat §3.4/§3.5) masuk graph — wave
+di bawah beda dari versi dokumentasi sebelumnya (yang cuma 7 wave, 0-6).
+
 | Wave | Asset |
 |---|---|
 | **0** | `l0_raw` (source, tidak dimaterialize) |
 | **1** | `harmonized_post`, `harmonized_comment`, `harmonized_profile`, `harmonized_audience`, `harmonized_story`, `harmonized_tagged_post` |
-| **2** | `unified_profile`, `unified_audience`, `unified_story`, `unified_tagged_post`, `unified_competitor_post`, `unified_competitor_profile_daily` |
-| **3** | `unified_post`, `mart_story_funnel`, `mart_tiktok_churn`, `ugc_tagged_posts`, `audience_demographics_daily`, `audience_geo_daily`, `competitor_post_metric` |
-| **4** | `unified_comment`, `post_metric`, `mart_content_attributes`, `posting_time_heatmap`, `mart_pillar_performance`, `competitor_profile_metric_daily` |
-| **5** | `comment_relevance_scores`, `comment_sentiment_scores`, `mart_brand_metric_daily`, `post_comment_timeline`, `post_wordcloud`, `dim_content_pillar`, `mart_comment_activity` |
-| **6** *(terakhir)* | `mart_community_contributors`, `comment_relevance_distribution`, `comment_sentiment_daily`, `comment_sentiment_post` |
+| **2** | `harmonized_tiktok_profile_native`, `normalized_audience_percentage`, `unified_story`, `unified_tagged_post`, `unified_competitor_post` |
+| **3** | `gapfilled_profile_dates`, `unified_audience`, `tagged_post_caption_sentiment_scores`, `ugc_tagged_posts`, `competitor_post_metric` |
+| **4** | `unified_profile`, `unified_competitor_profile_daily`, `audience_demographics_daily`, `audience_geo_daily` |
+| **5** | `unified_post`, `mart_story_funnel`, `mart_tiktok_churn`, `competitor_profile_metric_daily` |
+| **6** | `unified_comment`, `post_metric`, `mart_content_attributes`, `mart_pillar_performance`, `posting_time_heatmap`, `post_caption_sentiment_scores` |
+| **7** | `comment_relevance_scores`, `comment_sentiment_scores`, `mart_brand_metric_daily`, `mart_comment_activity`, `dim_content_pillar`, `post_comment_timeline`, `post_wordcloud` |
+| **8** *(terakhir)* | `mart_community_contributors`, `comment_relevance_distribution`, `comment_sentiment_daily`, `comment_sentiment_post`, `audience_sentiment_monthly`, `comment_wordcloud_sentiment`, `ytd_performance` |
 
-⚠️ **Diubah 2026-09-04:** `mart_comment_activity` pindah dari wave 6 ke wave 5 —
-dependency-nya ke `comment_relevance_scores` (Feature) dihapus karena SP-nya
+⚠️ **Diubah 2026-09-04:** `mart_comment_activity` sudah tidak depend ke
+`comment_relevance_scores` (Feature) — dependency-nya dihapus karena SP-nya
 (`sp_build_comment_activity`) ternyata tidak pernah baca schema `feature` sama
 sekali (cuma `l1_silver.unified_comment` + `public.brand_social_accounts`).
-Sekarang dia jalan **paralel** dengan `comment_relevance_scores`, bukan nunggu
-NLP step (yang paling lambat di seluruh pipeline) kelar duluan tanpa alasan.
+Sekarang dia cuma depend ke `unified_comment` (wave 6), sehingga jatuh satu wave
+lebih cepat dari `comment_relevance_scores` (wave 7) — jalan **paralel** dengan NLP,
+bukan nunggu step paling lambat di pipeline tanpa alasan.
 
 Poin yang tidak kelihatan dari tabel per-layer di Bagian 3.2–3.6:
 
-- **`unified_post` baru jalan di wave 3**, bukan wave 2 — meskipun `harmonized_post`
-  sudah siap dari wave 1, dia tetap nunggu `unified_profile` (wave 2) kelar duluan
-  (untuk kolom `followers_on_post_day`).
-- **`mart_pillar_performance` (wave 4) harus kelar sebelum `dim_content_pillar`
-  (wave 5)** — satu-satunya dependency Gold→Gold di seluruh pipeline.
-- **`mart_community_contributors` jadi yang paling terakhir (wave 6)** — nunggu
-  `comment_relevance_scores` (hasil NLP, wave 5), yang sendirinya nunggu
-  `unified_comment` (wave 4). `mart_comment_activity` TIDAK lagi ikut nunggu di sini
-  (lihat catatan di atas).
-- **Rantai terpanjang** (critical path) di seluruh pipeline: `l0_raw` →
-  `harmonized_profile` → `unified_profile` → `unified_post` → `unified_comment` →
-  `comment_relevance_scores` → `mart_community_contributors` (6 langkah setelah raw,
-  ⚠️ endpoint-nya berubah dari `mart_comment_activity`, tapi panjang rantai tetap
-  sama — `comment_relevance_scores` masih jadi bottleneck utama). Ini yang menentukan
-  berapa lama minimal `daily_pipeline_job` bisa selesai, meskipun banyak resource
-  tersedia untuk paralelisasi. **Fix paling berdampak buat mempercepat pipeline
-  secara keseluruhan: percepat `comment_relevance_scores` sendiri** (mis. sudah
-  diubah 2026-09-04 jadi incremental — lihat §3.4) — bukan cuma menghilangkan
-  dependency yang tidak perlu.
+- **`unified_post` baru jalan di wave 5**, jauh setelah `harmonized_post` (wave 1)
+  siap — karena rantai `unified_profile` (dibutuhkan untuk `followers_on_post_day`)
+  sekarang melewati `gapfilled_profile_dates` (wave 3) dan `harmonized_tiktok_profile_native`
+  (wave 2) yang ditambahkan 2026-08-19, bukan langsung `harmonized_profile` seperti dulu.
+- **`mart_pillar_performance` (wave 6) harus kelar sebelum `dim_content_pillar`
+  (wave 7)** — satu-satunya dependency Gold→Gold di seluruh pipeline.
+- **Wave 8 (terakhir) sekarang berisi 7 asset**, bukan cuma `mart_community_contributors` —
+  semua mart yang depend ke `comment_relevance_scores`/`comment_sentiment_scores`
+  (hasil NLP, wave 7) jatuh di sini: `comment_relevance_distribution`,
+  `comment_sentiment_daily`, `comment_sentiment_post`, plus 2 mart baru 2026-09-08
+  (`audience_sentiment_monthly`, `comment_wordcloud_sentiment`) dan `ytd_performance`
+  (lewat rantai `mart_brand_metric_daily`).
+- **Rantai terpanjang** (critical path) di seluruh pipeline sekarang **8 langkah**
+  setelah raw (naik dari 6 di versi dokumentasi sebelumnya): `l0_raw` →
+  `harmonized_profile` → `harmonized_tiktok_profile_native` → `gapfilled_profile_dates`
+  → `unified_profile` → `unified_post` → `unified_comment` → `comment_relevance_scores`
+  → (`mart_community_contributors` / `comment_relevance_distribution` / dst di wave 8).
+  Penambahan 2026-08-19 (gap-fill + TikTok profile native) **memperpanjang** critical
+  path 2 langkah dari sebelumnya, di ATAS rantai NLP yang sudah jadi bottleneck lama.
+  **Fix paling berdampak buat mempercepat pipeline secara keseluruhan:** tetap
+  percepat `comment_relevance_scores` (sudah incremental sejak 2026-09-04, §3.4),
+  tapi sekarang juga worth dicek apakah `gapfilled_profile_dates` (yang me-re-run
+  3 proc profile sekaligus) bisa dipercepat atau dibuat lebih jarang jalan.
 
 ---
 
@@ -295,10 +320,11 @@ daily_schedule = ScheduleDefinition(
 
 ---
 
-## 6. Sensors — `new_account_sensor`
+## 6. Sensors — `new_account_sensor` & `csv_upload_sensor`
 
-Sejak 19 Juli 2026 `sensors.py` **tidak lagi kosong**. Ada satu sensor aktif:
-`new_account_sensor`.
+Sejak 19 Juli 2026 `sensors.py` **tidak lagi kosong**. Ada dua sensor aktif:
+`new_account_sensor` dan `csv_upload_sensor` (⚠️ ditambahkan 2026-07-30 — lihat §6.5,
+sensor ini sempat digugurkan dari blueprint awal lalu diaktifkan lagi).
 
 ### 6.1 Masalah yang Diselesaikan
 
@@ -430,16 +456,45 @@ Konsekuensinya:
   otomatis ke-nyapu di run berikutnya, jadi self-healing di atas tidak berlaku
   untuk mereka. Lihat `dokumentasi_silver_dan_gold_layer.md` §1/§4/§6 untuk detail per tabel.
 
-### 6.5 Sensor yang Gugur dari Blueprint Fase 5
+### 6.5 `csv_upload_sensor` ⚠️ diaktifkan 2026-07-30 (sebelumnya gugur di blueprint)
 
-Tiga sensor yang tadinya direncanakan tetap **tidak** diimplementasikan:
+Polling tiap 60 detik: "ada nggak baris baru `status='success'` di
+`public.csv_upload_logs` yang belum pernah ditrigger?" Kalau ada → trigger
+`daily_pipeline_job` (job yang sama persis dengan `new_account_sensor`), jadi
+data hasil upload CSV manual tidak perlu nunggu run malam.
 
-1. **`csv_upload_sensor`** — gugur karena sistem ini API-only (Meta/TikTok GraphAPI
-   langsung ke `l0_raw`), tidak ada upload file yang perlu di-watch.
-2. **`replica_lag_sensor`** — gugur karena replica Tiger Cloud murni untuk High
+**Beda desain dari `new_account_sensor` (kenapa tidak bisa pakai `NOT EXISTS`):**
+grain `new_account_sensor` per-akun, dan begitu akun itu sudah punya row di
+`l2_gold.post_metric`, `NOT EXISTS` otomatis jadi tombol-off. Grain
+`csv_upload_sensor` per-**baris-upload** (bisa banyak file per `batch_id`, dan
+brand yang sama bisa upload CSV berkali-kali) — kalau dipaksa `NOT EXISTS` ke
+gold, upload kedua untuk brand yang sama tidak akan pernah trigger. Makanya
+sensor ini pakai **cursor** (`context.cursor`, disimpan sebagai `created_at` row
+terakhir yang sudah ditrigger), bukan `NOT EXISTS`.
+
+**Kenapa cukup satu gerbang (`status='success'`)** tanpa `EXISTS` raw / `NOT EXISTS`
+gold: `status` di `csv_upload_logs` cuma keisi kalau proses tulis ke `l0_raw`
+sudah selesai (CHECK constraint cuma izinkan `success`/`failed`/`skipped`, row
+baru muncul setelah proses kelar) — tidak ada state "in progress" yang perlu
+difilter. `failed` & `skipped` sengaja diabaikan.
+
+**Inisialisasi cursor:** tick pertama sensor ini `RUNNING`, `context.cursor` masih
+`None` → histori lama **tidak** diproses. Cursor langsung diisi ke `NOW()` dari DB
+(bukan waktu Python, biar konsisten timezone), lalu sensor `SkipReason`. Baru
+baris **setelah** titik itu yang memicu run.
+
+`run_key` = gabungan sorted row id (`"csv_upload:<id1>,<id2>"`) — pola sama seperti
+`new_account_sensor`, prefix beda supaya gampang dibedakan di UI.
+
+### 6.6 Sensor yang Tetap Gugur dari Blueprint Fase 5
+
+Dua sensor yang tadinya direncanakan tetap **tidak** diimplementasikan (⚠️
+`csv_upload_sensor` sudah dikeluarkan dari daftar ini sejak 2026-07-30 — lihat §6.5):
+
+1. **`replica_lag_sensor`** — gugur karena replica Tiger Cloud murni untuk High
    Availability/failover (async standby). Pipeline selalu baca-tulis ke **primary**,
    tidak pernah baca dari replica, jadi lag replica tidak memengaruhi kebenaran data.
-3. **`harmonization_job`** (job/sensor terpisah untuk harmonization) — gugur karena
+2. **`harmonization_job`** (job/sensor terpisah untuk harmonization) — gugur karena
    harmonization sekarang jadi asset Dagster biasa yang otomatis masuk
    `daily_pipeline_job`, tidak perlu job terpisah.
 
@@ -452,12 +507,15 @@ Tiga sensor yang tadinya direncanakan tetap **tidak** diimplementasikan:
 - **Akun brand baru:** tidak perlu tindakan manual. Begitu backend menulis row
   `success` di `public.initial_scrape_logs` dan raw-nya sudah masuk,
   `new_account_sensor` akan trigger `daily_pipeline_job` dalam ≤60 detik.
-- **Cek kondisi sensor:** Dagster UI → Sensors → `new_account_sensor` → lihat tick
-  history. Tick berwarna abu dengan `SkipReason` = normal (artinya tidak ada akun
-  yang memenuhi syarat). Kalau akun baru tidak kunjung kepicu, cek berurutan:
-  (1) `connected = true`? (2) ada row di `l0_raw.*_snapshots`? (3) ada row
-  `success` di `initial_scrape_logs`? (4) apakah `l2_gold.post_metric` sudah
-  terlanjur punya row untuk akun itu (berarti sudah diolah)?
+- **Cek kondisi sensor:** Dagster UI → Sensors → `new_account_sensor` atau
+  `csv_upload_sensor` → lihat tick history. Tick berwarna abu dengan `SkipReason` =
+  normal (artinya tidak ada akun/upload yang memenuhi syarat). Untuk akun baru yang
+  tidak kunjung kepicu, cek berurutan: (1) `connected = true`? (2) ada row di
+  `l0_raw.*_snapshots`? (3) ada row `success` di `initial_scrape_logs`? (4) apakah
+  `l2_gold.post_metric` sudah terlanjur punya row untuk akun itu (berarti sudah
+  diolah)? Untuk upload CSV yang tidak kunjung kepicu, cek: (1) row-nya
+  `status='success'` di `public.csv_upload_logs`? (2) `created_at`-nya lebih baru
+  dari cursor sensor (tick pertama sensor RUNNING tidak memproses histori lama)?
 - **Materialize selektif (asset tertentu saja):** pilih asset spesifik di Dagster UI
   lalu klik "Materialize" (bukan "Materialize all") — ini praktik yang sudah dipakai
   untuk menghindari trigger operasi NLP yang mahal secara tidak sengaja. Dagster
@@ -492,9 +550,13 @@ Tiga sensor yang tadinya direncanakan tetap **tidak** diimplementasikan:
   duluan sebelum `mart_pillar_performance` terisi, seed-nya kosong.
 - **Freshness check tidak mencakup `unified_tagged_post`** — jangan kaget kalau tidak
   ada alert meskipun data UGC lama tidak update, itu memang disengaja.
-- **`comment_sentiment_scores` UPSERT, `comment_relevance_scores` REPLACE penuh** —
-  kalau butuh re-score ulang seluruh histori sentimen (misal ganti model), harus
-  manual TRUNCATE dulu karena asset-nya tidak didesain untuk full-refresh otomatis.
+- **Keempat asset Feature (`comment_relevance_scores`, `comment_sentiment_scores`,
+  `post_caption_sentiment_scores`, `tagged_post_caption_sentiment_scores`) sekarang
+  semuanya INCREMENTAL** (⚠️ `comment_relevance_scores` diubah dari REPLACE penuh
+  ke `ON CONFLICT DO NOTHING` per 2026-09-04) — kalau butuh re-score ulang seluruh
+  histori (misal ganti model), harus manual TRUNCATE/DELETE dulu karena keempatnya
+  tidak didesain untuk full-refresh otomatis. `word_frequencies` (tabel kedua yang
+  ditulis `comment_relevance_scores`) tetap REPLACE penuh.
 - **`new_account_sensor` bergantung pada disiplin backend.** Sensor cuma seaman
   timing INSERT ke `initial_scrape_logs`. Kalau backend menulis `success` begitu
   API call selesai (bukan setelah semua data ter-commit ke `l0_raw`), sensor bisa

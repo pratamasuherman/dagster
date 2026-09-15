@@ -7,11 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
     "dagster",
     "dagster-webserver",
-    "psycopg2-binary",
+    "psycopg",
     "pandas",
     "numpy",
     "redis",
     "sentence-transformers",
+    "transformers",
 ]
 
 [project.optional-dependencies]

@@ -1,6 +1,17 @@
 # Dokumentasi Layer `l0_raw` & `l0_harmonization` — Autometric
 
 > Dibuat: 10 Juli 2026. Disusun berdasarkan hasil query langsung ke `tsdb` (Tiger Cloud Singapore). Sesuai prinsip "cek realita DB dulu" — semua isi dokumen ini berasal dari struktur database aktual, bukan asumsi dari kode aplikasi.
+>
+> ⚠️ **Catatan 2026-09-10:** sejak 2026-08-19, `autometric/assets/harmonization_assets.py`
+> menambahkan 3 procedure/asset baru yang mengubah beberapa temuan di bawah ini
+> (lihat §5 dan §8) — TikTok comment & TikTok audience sekarang PUNYA jalur sync
+> dari raw (sebelumnya dianggap anomali/tidak ada), dan ada 2 procedure housekeeping
+> baru (gap-fill tanggal profile, koreksi pembulatan audience). Detail kolom
+> tabel-tabel baru (`l0_raw.tt_comments`, `l0_harmonization.tiktok_audience`,
+> `l0_extra.tt_profile_native`) **belum di-query ulang ke DB** untuk dokumen ini —
+> yang di bawah cuma dari deskripsi asset Dagster, bukan `information_schema`
+> langsung seperti sisa dokumen ini. Query ulang bagian 2 kalau butuh detail kolom
+> pasti.
 
 ---
 
@@ -806,7 +817,26 @@ Semua `brand_id` di tabel-tabel ini FK ke `public.social_accounts(id)`.
 
 ## 5. Procedure Sinkronisasi (`l0_raw → l0_harmonization`)
 
-Ada **14 objek**: 1 function helper + 1 orchestrator + 12 procedure sync per entitas.
+Ada **14 objek** per query 10 Juli 2026 (1 function helper + 1 orchestrator + 12
+procedure sync per entitas) — ⚠️ **+5 objek baru sejak 2026-08-19** (dikonfirmasi
+dari `autometric/assets/harmonization_assets.py`, belum di-query ulang detail
+definisinya ke DB untuk dokumen ini):
+
+| Procedure baru (2026-08-19) | Fungsi (dari deskripsi asset Dagster) |
+|---|---|
+| `sp_sync_tiktok_comment_from_raw()` | Dari `l0_raw.tt_comments` (tabel raw BARU — sebelumnya tidak ada, lihat §8 poin 1 yang sekarang resolved) → `l0_harmonization.tiktok_comment`. |
+| `sp_sync_tiktok_audience_from_raw()` | Sumber TikTok audience (raw TikTok tidak API — kemungkinan `l0_extra`, belum diverifikasi) → `l0_harmonization.tiktok_audience` (tabel BARU, tidak ada di tabel §4.1). |
+| `sp_sync_tiktok_profile_native_from_extra()` | Dari `l0_extra.tt_profile_native` → UPDATE kolom `video_views`, `profile_reach`, `profile_views`, `comments`, `shares`, `net_growth`, `new_followers`, `lost_followers` di `l0_harmonization.tiktok_profile` (sebelumnya NULL terus). HARUS jalan setelah `sp_sync_tiktok_profile_from_raw` (match `brand_id`+`date`). |
+| `sp_gapfill_profile_dates()` | Isi baris kosong (gap tanggal) profile snapshot dari tanggal akun didaftarkan sampai hari ini, untuk `facebook_profile`/`instagram_profile`/`tiktok_profile` sekaligus. LOCF untuk state field, 0 untuk flow field. MineralQUA + kompetitornya sengaja di-exclude (data demo/sintetis). |
+| `sp_normalize_audience_percentage_rounding()` | Koreksi drift pembulatan pada `instagram_audience`/`tiktok_audience`: kalau total value per grup (brand_id, date, audience_type, dimension_key) 95–105 → dikoreksi ke tepat 100 (largest-remainder). Format absolut (jauh dari 100) tidak disentuh. |
+
+Kelima procedure baru ini dipanggil lewat asset Dagster terpisah
+(`harmonized_tiktok_profile_native`, `gapfilled_profile_dates`,
+`normalized_audience_percentage` — lihat `dokumentasi_dagster_autometric.md` §3.2),
+BUKAN lewat `sp_sync_all_from_raw()` orchestrator lama; belum dikonfirmasi apakah
+orchestrator itu sendiri sudah diupdate untuk memanggilnya juga.
+
+Daftar 14 objek asli (10 Juli 2026):
 
 | Procedure/Function | Fungsi |
 |---|---|
@@ -947,10 +977,19 @@ raw snapshots (banyak baris per fetch)
 
 Sesuai prinsip "cek realita dulu" — ini fakta dari DB, bukan tebakan gue soal penyebabnya. Perlu diverifikasi manual:
 
-1. **`tiktok_comment` punya 110 baris data, tapi:**
-   - Tidak ada procedure `sp_sync_tiktok_comment_from_raw` (cek daftar 14 procedure di bagian 5 — nggak ada).
-   - Tidak ada tabel raw untuk komentar TikTok (`l0_raw` cuma punya `tt_profile_snapshots` & `tt_video_snapshots` untuk TikTok, nggak ada comment).
-   - Berarti 110 baris itu masuk lewat jalur lain — kemungkinan insert manual, backfill lama, atau procedure yang pernah ada terus dihapus (`DROP PROCEDURE`) tapi datanya tertinggal. Perlu ditelusuri sebelum dianggap sebagai sumber data yang reliable/refreshable.
+1. ~~**`tiktok_comment` punya 110 baris data, tapi tidak ada procedure/tabel raw sumbernya.**~~
+   ⚠️ **RESOLVED 2026-08-19** — `sp_sync_tiktok_comment_from_raw()` sekarang ada
+   (dikonfirmasi dari `harmonization_assets.py`: komentar kode eksplisit bilang
+   "`sp_sync_tiktok_comment_from_raw` dibuat 2026-08-19, `l0_raw.tt_comments`
+   sekarang ada"). Jadi TikTok comment sekarang punya jalur sync reguler dari raw,
+   bukan lagi data misterius/tidak-refreshable. Baris raw & harmonization untuk
+   sebelum 2026-08-19 kemungkinan tetap dari jalur lama (manual/backfill) yang
+   disebut di catatan asli di bawah — belum diverifikasi, tapi tidak lagi relevan
+   untuk data baru yang masuk setelah tanggal itu. Detail kolom `l0_raw.tt_comments`
+   belum di-query ulang untuk dokumen ini (lihat catatan header).
+   *(Catatan asli, sebelum 2026-08-19, untuk konteks histori):* tidak ada procedure
+   `sp_sync_tiktok_comment_from_raw` maupun tabel raw TikTok comment — 110 baris
+   yang ada kemungkinan masuk lewat insert manual/backfill lama.
 
 2. **`sp_sync_facebook_audience_from_raw()` ada di database, tapi baris pemanggilannya di-comment di `sp_sync_all_from_raw()`:**
    ```sql
@@ -981,5 +1020,7 @@ Sesuai prinsip "cek realita dulu" — ini fakta dari DB, bukan tebakan gue soal 
 | `instagram_tagged_post` | `ig_tagged_posts` | — (main only) | `sp_sync_instagram_tagged_post_from_raw` |
 | `instagram_audience` | `ig_profile_snapshots.demographics_*` | — (main only) | `sp_sync_instagram_audience_from_raw` |
 | `tiktok_profile` | `tt_profile_snapshots` | `tiktok_competitor_snapshots` | `sp_sync_tiktok_profile_from_raw` |
+| `tiktok_profile` (kolom native, ⚠️ baru 2026-08-19) | `l0_extra.tt_profile_native` | — | `sp_sync_tiktok_profile_native_from_extra` (UPDATE ke row yang sudah dibuat, jalan setelahnya) |
 | `tiktok_post` | `tt_video_snapshots` | `tiktok_competitor_media` | `sp_sync_tiktok_post_from_raw` |
-| `tiktok_comment` | ❓ tidak ada raw | ❓ tidak ada raw | ❓ tidak ada procedure |
+| `tiktok_comment` ⚠️ resolved 2026-08-19 | `l0_raw.tt_comments` (tabel baru) | belum diverifikasi | `sp_sync_tiktok_comment_from_raw` (dibuat 2026-08-19) |
+| `tiktok_audience` ⚠️ baru 2026-08-19, tabel tidak ada di §4.1 | belum diverifikasi | belum diverifikasi | `sp_sync_tiktok_audience_from_raw` (dibuat 2026-08-19) |
