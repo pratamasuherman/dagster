@@ -163,7 +163,14 @@ def mart_tiktok_churn(postgres: PostgresResource) -> Output:
     group_name="gold",
     deps=[_TAGGED],
     kinds={"postgres"},
-    description="mart ugc_tagged_posts (Tagged Posts, Audience Deep Dive) via sp_build_ugc_tagged_posts(). IG-only.",
+    description=(
+        "mart ugc_tagged_posts (Tagged Posts, Audience Deep Dive) via "
+        "sp_build_ugc_tagged_posts(). Facebook, Instagram, TikTok -- sebelumnya "
+        "IG-only, diperluas 2026-09-16 lewat harmonized_tagged_post + "
+        "sp_sync_unified_tagged_post. FB/TikTok masih kosong sampai ingest "
+        "l0_raw.fb_tagged_posts / l0_raw.tt_tagged_posts (Meta Graph API / "
+        "TikTok Business API) berjalan."
+    ),
 )
 def ugc_tagged_posts(postgres: PostgresResource) -> Output:
     return _build(postgres, "sp_build_ugc_tagged_posts", "ugc_tagged_posts")

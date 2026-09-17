@@ -19,7 +19,11 @@ Catatan platform (sesuai DB asli, di-update 2026-08-19):
                2026-08-19. facebook_audience_from_raw MASIH TIDAK dipanggil
                di sini -- lihat catatan deprecated di harmonized_audience.)
   - story    : instagram saja
-  - tagged   : instagram saja        (opsional, tidak dipakai Silver inti)
+  - tagged   : facebook, instagram, tiktok  (sp_sync_facebook_tagged_post_from_raw
+               & sp_sync_tiktok_tagged_post_from_raw ditambahkan 2026-09-16,
+               l0_raw.fb_tagged_posts & l0_raw.tt_tagged_posts sekarang ada.
+               Dipakai Silver via sp_sync_unified_tagged_post yang sudah
+               di-UNION 3 platform di sisi DB)
 
 Tambahan 2026-08-19 (audit l0_raw -> l2_gold, lihat NOTES_db_pipeline):
   - harmonized_tiktok_profile_native : l0_extra.tt_profile_native -> kolom
@@ -148,15 +152,19 @@ def harmonized_story(postgres: PostgresResource) -> Output:
     deps=[l0_raw],
     kinds={"postgres"},
     description=(
-        "raw -> l0_harmonization.instagram_tagged_post (instagram saja). "
-        "CATATAN: tabel ini diisi dari raw, TAPI belum dibaca procedure Silver "
-        "mana pun (belum tersambung ke hilir). Disertakan untuk kelengkapan; "
-        "sambungkan ke Silver bila fitur 'tagged posts' dibangun."
+        "raw -> l0_harmonization.*_tagged_post (facebook, instagram, tiktok). "
+        "facebook_tagged_post & tiktok_tagged_post ditambahkan 2026-09-16 "
+        "(l0_raw.fb_tagged_posts & l0_raw.tt_tagged_posts, sumber rencana: "
+        "Meta Graph API & TikTok Business API, bukan Apify). Sudah tersambung "
+        "ke hilir lewat sp_sync_unified_tagged_post (di-UNION 3 platform) dan "
+        "seterusnya ke ugc_tagged_posts & tagged_post_caption_sentiment_scores."
     ),
 )
 def harmonized_tagged_post(postgres: PostgresResource) -> Output:
     return _harmonize(postgres, [
         "sp_sync_instagram_tagged_post_from_raw",
+        "sp_sync_facebook_tagged_post_from_raw",
+        "sp_sync_tiktok_tagged_post_from_raw",
     ], "tagged_post")
 
 

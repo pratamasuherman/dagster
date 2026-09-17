@@ -17,7 +17,7 @@ Pemetaan dependency entitas:
   unified_profile     <- gapfilled_profile_dates  (bukan langsung
                           harmonized_profile -- lihat catatan 2026-08-19)
   unified_story       <- harmonized_story
-  unified_tagged_post <- harmonized_tagged_post   (IG-only, UGC)
+  unified_tagged_post <- harmonized_tagged_post   (FB/IG/TikTok sejak 2026-09-16, UGC)
 
 CATATAN 2026-08-19 (audit l0_raw -> l2_gold):
   unified_profile dan unified_audience sekarang depend ke asset TAMBAHAN
@@ -126,7 +126,7 @@ def unified_story(postgres: PostgresResource) -> Output:
     group_name="silver",
     deps=[harmonized_tagged_post],
     kinds={"postgres"},
-    description="Sinkronkan l1_silver.unified_tagged_post via sp_sync_unified_tagged_post() (IG-only, UGC). Independen.",
+    description="Sinkronkan l1_silver.unified_tagged_post via sp_sync_unified_tagged_post() (FB/IG/TikTok, UGC). Independen.",
 )
 def unified_tagged_post(postgres: PostgresResource) -> Output:
     return _sync(postgres, "sp_sync_unified_tagged_post", "unified_tagged_post")
