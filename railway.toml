@@ -1,0 +1,7 @@
+[railway]
+startCommand = "bash start.sh"
+healthcheckPath = "/"
+healthcheckPort = "$PORT"
+
+[build]
+dockerfilePath = "Dockerfile"

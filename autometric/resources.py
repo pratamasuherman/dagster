@@ -128,7 +128,7 @@ class SentimentModelResource(ConfigurableResource):
 class RedisResource(ConfigurableResource):
     """Invalidates dashboard cache keys for a given brand. brand_id is a UUID string."""
 
-    host: str = "localhost"
+    host: str = "redis.railway.internal"
     port: int = 6379
     ttl_seconds: int = 900
 
