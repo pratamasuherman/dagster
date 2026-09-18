@@ -11,6 +11,7 @@ dependencies = [
     "pandas",
     "numpy",
     "redis",
+    "python-dotenv",
     "sentence-transformers",
     "transformers",
 ]
