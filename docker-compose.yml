@@ -1,0 +1,114 @@
+# Docker Compose — Autometric Dagster Pipeline
+# ============================================================
+# Cara pakai:
+#   1. Copy .env.example -> .env, isi semua value.
+#   2. docker compose up --build
+#
+# Service:
+#   - dagster:  Dagster daemon + webserver + NLP pipeline
+#   - postgres: Database utama (TimescaleDB-compatible)
+#   - redis:    Cache invalidation untuk dashboard
+#
+# Volume persisten:
+#   - pgdata:   data PostgreSQL
+#   - redisdata: data Redis
+#   - hf_cache: cache model HuggingFace (antar redeploy)
+# ============================================================
+
+services:
+  # --------------------------------------------------------
+  # PostgreSQL — database utama
+  # --------------------------------------------------------
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: autometric_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-autometric}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD wajib di-set di .env}
+      POSTGRES_DB: ${POSTGRES_DB:-autometric_v2}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-autometric} -d ${POSTGRES_DB:-autometric_v2}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------
+  # Redis — cache invalidation
+  # --------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: autometric_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------
+  # Dagster — orchestration + NLP pipeline
+  # --------------------------------------------------------
+  dagster:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: autometric_dagster
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${DAGSTER_PORT:-3000}:3000"
+    environment:
+      # --- Database ---
+      AUTOMETRIC_DB_URL: ${AUTOMETRIC_DB_URL:-postgresql://${POSTGRES_USER:-autometric}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-autometric_v2}}
+
+      # --- Redis ---
+      REDIS_HOST: ${REDIS_HOST:-redis}
+
+      # --- Dagster ---
+      DAGSTER_HOME: /app/.dagster_home
+
+      # --- HuggingFace ---
+      HF_HOME: /root/.cache/huggingface
+      # (opsional) pakai token HF kalau model private
+      # HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN:-}
+
+      # --- Python ---
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # Cache model NLP persist antar redeploy container
+      - hf_cache:/root/.cache/huggingface
+      # Dagster home persist (run history, event log)
+      - dagster_home:/app/.dagster_home
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+# ============================================================
+# Volumes
+# ============================================================
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local
+  hf_cache:
+    driver: local
+  dagster_home:
+    driver: local

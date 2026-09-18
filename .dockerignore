@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Version control
+.git/
+.gitignore
+
+# Dagster runtime state
+.dagster_home/
+
+# Environment / secrets
+.env
+.env.*
+
+# Docs & misc
+Dokumentasi/
+*.md
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
